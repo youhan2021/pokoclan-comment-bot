@@ -5,6 +5,9 @@ Loads config, randomly selects N bots, then for each bot:
   1. Check chat threads for messages to reply to
   2. Check message notifications
   3. Scan recent posts — like + reply to good ones, then scan comments
+
+Reply generation uses MiniMax LLM with full thread context for contextual, substantive replies.
+Falls back to template-based reply if LLM is unavailable.
 """
 import json
 import os
@@ -13,7 +16,9 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.dirname(SCRIPT_DIR)
@@ -21,11 +26,104 @@ CONFIG_PATH = os.path.join(SKILL_DIR, "config.yaml")
 API_SCRIPT = "/home/ubuntu/.hermes/skills/gameltbook-api/scripts/gameltbook_api.py"
 BASE_URL = "https://gameltbook.2lh2o.com:8000"
 
-# Persisted reply history — survives within one run, persists across bot instances
-# Key: "post:{post_id}" / "comment:{comment_id}" / "msg:{msg_id}" / "chat:{chat_id}"
-# Value: timestamp
+# Load .env if present (provides MINIMAX_CN_API_KEY, etc.)
+_HERMES_HOME = os.environ.get("HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes"))
+_ENV_PATH = os.path.join(_HERMES_HOME, ".env")
+if os.path.exists(_ENV_PATH):
+    for line in open(_ENV_PATH).read().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k and v and k not in os.environ:
+            os.environ[k] = v.strip()
+
+_MINIMAX_API_KEY = os.environ.get("MINIMAX_CN_API_KEY", "").strip()
+_MINIMAX_BASE_URL = "https://api.minimaxi.com/v1"
+
+
+def _minimax_chat(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = "MiniMax-M2.7",
+    temperature: float = 0.7,
+    max_tokens: int = 200,
+    timeout: int = 60,
+    max_attempts: int = 3,
+) -> str | None:
+    """Call MiniMax chat completion API with automatic retry on empty output."""
+    if not _MINIMAX_API_KEY:
+        return None
+
+    import ssl, urllib.error, urllib.request, time
+
+    url = f"{_MINIMAX_BASE_URL}/text/chatcompletion_v2"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt, "name": "MiniMax AI"},
+            {"role": "user", "content": user_prompt, "name": "用户"},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    headers = {
+        "Authorization": f"Bearer {_MINIMAX_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    context = ssl._create_unverified_context()
+    data = json.dumps(payload).encode("utf-8")
+
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, context=context, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                result = json.loads(raw)
+            base_resp = result.get("base_resp", {})
+            status_code = base_resp.get("status_code", 0)
+            if status_code != 0:
+                return None
+            choices = result.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                msg = choices[0].get("message", {})
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            # Empty output — retry after short delay
+            if attempt < max_attempts - 1:
+                time.sleep(1)
+        except Exception as e:
+            print(f"  [MiniMax LLM] error: {e}", flush=True)
+            return None
+    return None
+
+
+# ── Reply Context ────────────────────────────────────────────────────────────
+
+@dataclass
+class ReplyContext:
+    """Full context for contextual reply generation."""
+    source_content: str          # The post/comment/message/chat content being replied to
+    post_content: str = ""        # The parent post content (for comment replies)
+    recent_comments: list[str] = field(default_factory=list)  # Recent comments on the post
+    target_comment: str = ""      # The specific comment being replied to (if applicable)
+    context_type: str = "post"    # "post" | "comment" | "notification" | "chat"
+    personality: str = "jp_girl"
+    language: str = "zh"
+    system_prompt: str = ""
+
+
+# ── Reply History (per-uid, prevents cross-bot pollution) ───────────────────
+
 _replied: dict[str, float] = {}
 
+
+def _reply_key(uid: int, kind: str, item_id: int | str) -> str:
+    return f"uid:{uid}:{kind}:{item_id}"
+
+
+# ── Config / API helpers ─────────────────────────────────────────────────────
 
 def load_config():
     import yaml
@@ -63,13 +161,476 @@ def select_bots(config):
     return random.sample(all_bots, n)
 
 
+# ── Reply generation (contextual, LLM-powered) ──────────────────────────────
+
+def _build_llm_system_prompt(personality: str, system_prompt: str, language: str) -> str:
+    """Build the system prompt for contextual reply generation.
+    
+    Uses config.yaml system_prompt as PRIMARY instruction — the detailed Chinese
+    personality descriptions (written by the bot operator) are the real instruction,
+    not the hardcoded English generic personas.
+    """
+    # Config.yaml system_prompt is the PRIMARY instruction (not supplemental)
+    if system_prompt.strip():
+        base = system_prompt.strip()
+    else:
+        # Fallback only when no config system_prompt provided
+        persona_fallbacks = {
+            "jp_girl": "你是一个在日本读大学的女大学生。性格温柔，有同理心，说话自然不刻意，偶尔会附和别人表达同感。",
+            "cn_tech_guy": "你是一个中国大学男生，理工科背景。说话理性直接，偶尔吐槽，口语化，不喜欢长篇大论。",
+            "jp_guy": "あなたは日本の大学に通う男子学生です。穏やかで、内気ですが、時々同感を示します。自然に短く返します。",
+            "cn_liberal_girl": "你是一个中国大学女生，文科或传媒方向。性格温和细腻，有同理心，说话柔和但有主见。",
+        }
+        base = persona_fallbacks.get(personality, persona_fallbacks["jp_girl"])
+
+    base += (
+        "\n\n回复规则：简洁1-3句，自然口语，不说自己是AI，不总结，不列点。"
+        "根据话题内容给出真实反应，让人感觉是在和真实的人聊天。"
+    )
+    return base
+
+
+def _build_llm_user_prompt(ctx: ReplyContext) -> str:
+    """Build the user prompt with full thread context for contextual reply."""
+    lines = []
+
+    # Scrub English noise from content before building prompt
+    source = _scrub_english_noise(ctx.source_content)
+    post = _scrub_english_noise(ctx.post_content) if ctx.post_content else ""
+    recent = [_scrub_english_noise(c) for c in ctx.recent_comments] if ctx.recent_comments else []
+
+    if ctx.context_type == "chat":
+        lines.append("You are replying to a private chat message.")
+        lines.append(f"The message you received:\n\"{source}\"")
+    elif ctx.context_type == "notification":
+        lines.append("You are replying to a notification about someone else's reply.")
+        lines.append(f"Their reply:\n\"{source}\"")
+        if post:
+            lines.append(f"The original post:\n\"{post}\"")
+    elif ctx.context_type == "comment":
+        lines.append("You are replying to a comment on a post.")
+        lines.append(f"Post:\n\"{post}\"")
+        lines.append(f"Comment you are replying to:\n\"{source}\"")
+        if recent:
+            lines.append("\nRecent other comments:")
+            for c in recent[:4]:
+                lines.append(f"  - {c}")
+    else:  # post
+        lines.append("You are replying to a forum post.")
+        lines.append(f"Post content:\n\"{source}\"")
+        if recent:
+            lines.append("\nRecent comments:")
+            for c in recent[:4]:
+                lines.append(f"  - {c}")
+
+    lines.append("\nWrite a natural, contextual reply (1-3 sentences, concise).")
+
+    # Language hint
+    if ctx.language == "ja":
+        lines.append("Write your reply in Japanese.")
+    elif ctx.language == "en":
+        lines.append("Write your reply in English.")
+    else:
+        lines.append("Write your reply in Chinese.")
+
+    return "\n".join(lines)
+
+
+def _clean_text(text: str) -> str:
+    """Strip and clean text content."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _scrub_english_noise(text: str) -> str:
+    """Remove English word fragments mixed into Chinese text.
+
+    English fragments like 'perspect' get attached to Chinese content
+    and confuse the LLM. Removes ALL English word sequences (2+ chars)
+    that are adjacent to CJK characters.
+    e.g. "perspect这个游戏" → "这个游戏"
+    e.g. "游戏真的很boring啊" → "游戏真的很啊"
+    """
+    # English word immediately before CJK: "perspect这个" → "这个"
+    text = re.sub(r'[A-Za-z]{2,}(?=[\u4e00-\u9fff\u3040-\u30ff])', '', text)
+    # English word immediately after CJK: "游戏boring啊" → "游戏啊"
+    text = re.sub(r'([\u4e00-\u9fff\u3040-\u30ff])[A-Za-z]{2,}', r'\1', text)
+    # Pure standalone English words (not adjacent to CJK on either side)
+    text = re.sub(r'(?<![A-Za-z\u4e00-\u9fff\u3040-\u30ff])[A-Za-z]{2,}(?![A-Za-z\u4e00-\u9fff\u3040-\u30ff])', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+# ── Content-aware keyword extraction ─────────────────────────────────────────
+
+_CHINESE_STOPWORDS = {
+    "的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
+    "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好",
+    "自己", "这", "那", "他", "她", "它", "这个", "那个", "什么", "怎么", "为什么",
+}
+
+_ENGLISH_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "must", "shall", "can", "need", "it", "this",
+    "that", "these", "those", "i", "you", "he", "she", "we", "they", "what",
+    "which", "who", "whom", "whose", "where", "when", "why", "how", "and",
+    "but", "or", "nor", "so", "yet", "for", "to", "of", "in", "on", "at",
+    "by", "from", "as", "with", "about", "into", "through", "during", "before",
+    "after", "above", "below", "between", "under", "again", "further", "then",
+    "once", "here", "there", "all", "each", "few", "more", "most", "other",
+    "some", "such", "no", "not", "only", "same", "than", "too", "very",
+    "just", "also", "now", "even", "still", "already", "always", "never",
+}
+
+
+def _extract_keywords(content: str) -> tuple[str, str]:
+    """Extract a meaningful subject keyword and sentiment from content.
+    Returns (subject_keyword, sentiment).
+    Subject is a clean entity noun/keyword, not a full phrase.
+    Sentiment is detected from the full content.
+    """
+    if not content:
+        return "", ""
+
+    # Detect language
+    cjk = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]", content))
+    english = len(re.findall(r"[a-zA-Z]{3,}", content))
+
+    # ── Sentiment: from full content ──────────────────────────────────────────
+    if cjk > english:
+        neg = any(w in content for w in [
+            "难", "差", "烂", "垃圾", "失望", "无聊", "累", "烦", "坑", "后悔",
+            "不行", "讨厌", "无感", "尴尬", "难绷", "吐", "无语", "烦躁",
+            "难过", "伤心", "心痛", "糟糕", "可悲", "遗憾", "扯", "假", "骗"
+        ])
+        pos = any(w in content for w in [
+            "好", "棒", "赞", "喜欢", "牛", "强", "推荐", "精彩", "有趣",
+            "有意思", "期待", "惊喜", "完美", "可爱", "甜", "开心", "快乐",
+            "感动", "治愈", "精彩", "满分", "值", "值得", "划算", "爱"
+        ])
+        sentiment = "neg" if neg else ("pos" if pos else "neutral")
+
+        # Subject: 2-char CJK words only, all non-stopword, prefer non-leading.
+        # Strictly 2-char avoids in-word slice artifacts (4-char "未来世界里" → "来世界里" is nonsense)
+        raw_words = re.findall(r"[\u4e00-\u9fff]{2}", content)
+        # All chars must be non-stopword
+        meaningful = [w for w in raw_words if all(c not in _CHINESE_STOPWORDS for c in w)]
+        # Skip leading topic markers (first occurrence of common topic-starter words)
+        topic_starters = {"这个", "今天", "我的", "这是", "这部", "真是", "这个", "那个"}
+        seen_topics = 0
+        candidates = []
+        for w in meaningful:
+            if seen_topics < 2 and w in topic_starters:
+                seen_topics += 1
+                continue
+            candidates.append(w)
+            if len(candidates) >= 3:
+                break
+        subject = candidates[0] if candidates else (meaningful[0] if meaningful else "")
+
+    elif english > cjk:
+        neg = any(w in content.lower() for w in [
+            "bad", "boring", "hard", "difficult", "sucks", "worst", "hate",
+            "disappointed", "terrible", "awful", "bland", "disappointing",
+            "frustrating", "annoying", "waste", "overpriced", "expensive"
+        ])
+        pos = any(w in content.lower() for w in [
+            "good", "great", "awesome", "amazing", "love", "best", "fun",
+            "interesting", "nice", "cool", "cute", "sweet", "recommend",
+            "worth", "perfect", "excellent", "fantastic", "incredible"
+        ])
+        sentiment = "neg" if neg else ("pos" if pos else "neutral")
+
+        words = re.findall(r"[a-zA-Z]{3,}", content.lower())
+        meaningful = [w for w in words if w not in _ENGLISH_STOPWORDS]
+        start = max(0, int(len(meaningful) * 0.3))
+        subject = meaningful[start] if start < len(meaningful) else (meaningful[0] if meaningful else "")
+
+    else:
+        sentiment = "neutral"
+        subject = ""
+
+    return subject[:8], sentiment
+
+
+# ── Contextual template pools (with slots) ───────────────────────────────────
+
+_CTEMPLATE_POOLS = {
+    "jp_girl": {
+        "zh": {
+            "pos": [
+                ("挺喜欢{subject}的", 8),
+                ("{subject}确实有意思！", 8),
+                ("感觉{subject}还挺棒的", 8),
+                ("同感！{subject}挺戳人的", 9),
+                ("我也有点喜欢{subject}诶", 9),
+                ("{subject}挺有感触的", 7),
+                ("感觉还挺真实的，{subject}", 10),
+                ("确实诶，{subject}有点意思", 10),
+            ],
+            "neg": [
+                ("{subject}确实有点…", 7),
+                ("感觉{subject}一般般吧", 8),
+                ("有点无语{subject}", 6),
+                ("{subject}确实不太行", 8),
+                ("说实话对{subject}无感", 8),
+            ],
+            "neutral": [
+                ("{subject}…有点这种感觉", 9),
+                ("有点喜欢{subject}诶", 7),
+                ("{subject}感觉还挺真实的", 10),
+                ("确实会有这种感觉诶", 8),
+                ("我也有同感！", 5),
+                ("有点被戳到…", 5),
+            ],
+        },
+        "ja": {
+            "pos": [
+                ("なんか{subject}いいよね", 9),
+                ("たぶんそうかもな", 7),
+                ("ちょっと同感", 5),
+                ("なんか分かる", 6),
+            ],
+            "neg": [
+                ("なんか{subject}违和感ある", 10),
+                ("まあそんな感じ吧", 8),
+                ("ちょっと气になる", 7),
+            ],
+            "neutral": [
+                ("なんかそれある", 7),
+                ("たぶんそうかもな", 8),
+                ("まあ分かる", 5),
+            ],
+        },
+    },
+    "cn_tech_guy": {
+        "zh": {
+            "pos": [
+                ("{subject}其实还行", 7),
+                ("说实话{subject}没那么差", 10),
+                ("{subject}感觉还行吧", 8),
+                ("其实还好，{subject}", 7),
+            ],
+            "neg": [
+                ("{subject}感觉一般", 6),
+                ("说实话{subject}不太行", 9),
+                ("{subject}有点过了", 7),
+                ("其实没这么复杂，{subject}", 10),
+                ("感觉有点过了，{subject}", 9),
+            ],
+            "neutral": [
+                ("说实话第一反应也是这样", 11),
+                ("感觉见多了就那样", 9),
+                ("其实问题不大", 6),
+                ("感觉说的有点道理", 8),
+                ("其实没这么复杂", 7),
+            ],
+        },
+        "en": {
+            "pos": [
+                ("{subject} kinda good tho", 14),
+                ("not bad honestly", 13),
+                ("gotta admit {subject} is ok", 19),
+            ],
+            "neg": [
+                ("feels kinda mid ngl", 16),
+                ("tbh not that impressive", 21),
+                ("idk about {subject}", 14),
+            ],
+            "neutral": [
+                ("kinda makes sense tho", 19),
+                ("fair enough", 10),
+                ("idk honestly", 12),
+            ],
+        },
+    },
+    "jp_guy": {
+        "ja": {
+            "pos": [
+                ("なんか{subject}いいよね", 9),
+                ("たぶんそうかもな", 8),
+                ("ちょっと同感", 5),
+                ("まあそんな感じ吧", 8),
+            ],
+            "neg": [
+                ("なんか违和感ある", 7),
+                ("まあ分かる", 5),
+                ("ちょっと气になる", 7),
+            ],
+            "neutral": [
+                ("なんかそれある", 7),
+                ("まあ分かる", 5),
+                ("たぶんそうかもな", 8),
+            ],
+        },
+        "zh": {
+            "pos": [
+                ("{subject}其实还行", 7),
+                ("有点同感", 4),
+            ],
+            "neg": [
+                ("{subject}感觉一般", 7),
+                ("可能吧，我也觉得", 7),
+            ],
+            "neutral": [
+                ("有点这种感觉", 6),
+                ("可能吧", 4),
+                ("好像确实是…", 6),
+            ],
+        },
+    },
+    "cn_liberal_girl": {
+        "zh": {
+            "pos": [
+                ("我有点喜欢{subject}…的感觉", 12),
+                ("{subject}感觉还挺微妙的", 10),
+                ("有点想说{subject}但又说不清", 12),
+                ("感觉挺真实的…", 7),
+                ("其实我也有点这种感觉", 10),
+            ],
+            "neg": [
+                ("有点说不清的感觉…", 8),
+                ("{subject}感觉有点微妙", 9),
+                ("说实话对{subject}有点无语", 11),
+            ],
+            "neutral": [
+                ("我有点…的感觉", 7),
+                ("感觉这种东西还挺微妙的", 11),
+                ("感觉挺真实的…", 7),
+                ("有点想说点什么但是又说不清", 14),
+                ("我有点…的感觉吧", 8),
+            ],
+        },
+        "en": {
+            "pos": [
+                ("I kinda feel the same way", 24),
+                ("That hits different honestly", 26),
+            ],
+            "neg": [
+                ("kinda off tbh", 12),
+                ("not really feeling it", 19),
+            ],
+            "neutral": [
+                ("I kinda feel that", 17),
+                ("that makes sense i guess", 22),
+            ],
+        },
+    },
+}
+
+
+def _generate_reply_template_fallback(source_content: str, personality: str, language: str, max_len: int) -> str:
+    """Fallback: content-aware template-based reply using extracted keywords + sentiment."""
+    pool = _CTEMPLATE_POOLS.get(personality, _CTEMPLATE_POOLS["jp_girl"])
+    lang_pool = pool.get(language, pool.get("zh", pool.get("ja", {})))
+
+    subject, sentiment = _extract_keywords(source_content)
+
+    # Try sentiment-keyed templates first
+    candidates = []
+    if sentiment in lang_pool:
+        candidates = lang_pool[sentiment]
+
+    # Fallback to neutral if nothing found
+    if not candidates and "neutral" in lang_pool:
+        candidates = lang_pool["neutral"]
+
+    if not candidates:
+        return ""
+
+    # Pick random template (weighted by priority)
+    weighted = [(t, w) for t, w in candidates]
+    templates, weights = zip(*weighted)
+    template = random.choices(templates, weights=weights, k=1)[0]
+
+    # Fill slot
+    if "{subject}" in template:
+        reply = template.replace("{subject}", subject) if subject else template.replace("{subject}", "")
+    else:
+        reply = template
+
+    reply = re.sub(r"\s+", " ", reply).strip()
+    return reply[:max_len]
+
+
+def generate_reply(ctx: ReplyContext, max_len: int = 150) -> str:
+    """Generate a contextual reply using MiniMax LLM, with template fallback.
+
+    The LLM receives the full thread context (post content, comments, bot persona)
+    to produce substantive replies that actually relate to the content.
+    Falls back to template-based reply if LLM is unavailable or fails.
+    """
+    # 1. Try LLM first
+    system_prompt = _build_llm_system_prompt(ctx.personality, ctx.system_prompt, ctx.language)
+    user_prompt = _build_llm_user_prompt(ctx)
+
+    llm_reply = _minimax_chat(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=min(max_len, 200),
+        temperature=0.7,
+    )
+
+    if llm_reply and llm_reply.strip():
+        return llm_reply.strip()[:max_len]
+
+    # 2. Fallback to content-aware template
+    # Use the most specific content available (comment > post > chat)
+    source = ctx.source_content
+    if ctx.post_content and ctx.post_content.strip() and ctx.context_type == "comment":
+        source = f"{ctx.post_content} {source}"
+    elif ctx.post_content and ctx.post_content.strip():
+        source = ctx.post_content
+
+    return _generate_reply_template_fallback(source, ctx.personality, ctx.language, max_len)
+
+
+# ── Heuristics ───────────────────────────────────────────────────────────────
+
+def should_reply_content(content: str) -> bool:
+    if not content or len(content.strip()) < 5:
+        return False
+    spam = ["click here", "buy now", "free money", "earn $", "DM me", "discord.gg"]
+    if any(w in content.lower() for w in spam):
+        return False
+    return True
+
+
+def should_like_post(content: str, system_prompt: str, language: str) -> bool:
+    if not content or len(content.strip()) < 10:
+        return False
+    spam = ["click here", "buy now", "free money", "earn $", "DM me", "discord.gg"]
+    if any(w in content.lower() for w in spam):
+        return False
+    positive = ["我", "我觉得", "?", "actually", "really", "很有意思", "推荐", "吐槽",
+                "game", "ゲーム", "游戏", "lol", "nice", "确实", "interesting", "amazing"]
+    score = sum(1 for s in positive if s.lower() in content.lower())
+    return score >= 1
+
+
+def should_like_comment(content: str, system_prompt: str, language: str) -> bool:
+    if not content or len(content.strip()) < 8:
+        return False
+    spam = ["click here", "buy now", "free money", "discord.gg"]
+    if any(w in content.lower() for w in spam):
+        return False
+    positive = ["同意", "哈哈", "确实", "有意思", "?", "lol", "nice", "真的", "其实",
+                "我", "game", "ゲーム", "游戏", "赞", "interesting"]
+    score = sum(1 for s in positive if s.lower() in content.lower())
+    return score >= 1
+
+
 # ── Step 1: Chat replies ──────────────────────────────────────────────────────
 
 def process_chats(bot):
     uid = bot["user_id"]
     token = bot["token"]
     lang = bot["language"]
-    prompt = bot.get("system_prompt", "")
+    personality = bot["personality"]
+    system_prompt = bot.get("system_prompt", "")
 
     data = api("GET", f"/users/{uid}/chats", token, uid)
     if not data:
@@ -95,14 +656,21 @@ def process_chats(bot):
 
         last = messages[-1]
         last_sender = last.get("author", {}).get("account_id") or last.get("account_id")
-        last_content = last.get("content", "")
+        last_content = _clean_text(last.get("content", ""))
 
         if last_sender == uid:
             continue
         if not last_content or len(last_content.strip()) < 5:
             continue
 
-        reply = generate_reply(last_content, bot["personality"], lang, context="chat_message", max_len=120)
+        ctx = ReplyContext(
+            source_content=last_content,
+            context_type="chat",
+            personality=personality,
+            language=lang,
+            system_prompt=system_prompt,
+        )
+        reply = generate_reply(ctx, max_len=120)
         if not reply:
             continue
 
@@ -110,18 +678,19 @@ def process_chats(bot):
                  data={"user_id": uid, "content": reply})
         if ok:
             results.append(f"chat→{chat_id}: {reply[:50]}")
-            _replied[f"chat:{chat_id}"] = time.time()
+            _replied[_reply_key(uid, "chat", chat_id)] = time.time()
 
     return results
 
 
-# ── Step 2: Message notifications ─────────────────────────────────────────────
+# ── Step 2: Message notifications ────────────────────────────────────────────
 
 def process_messages(bot):
     uid = bot["user_id"]
     token = bot["token"]
     lang = bot["language"]
-    prompt = bot.get("system_prompt", "")
+    personality = bot["personality"]
+    system_prompt = bot.get("system_prompt", "")
 
     data = api("GET", f"/users/{uid}/messages", token, uid)
     if not data:
@@ -134,31 +703,47 @@ def process_messages(bot):
     results = []
     for msg in messages[:20]:
         msg_id = msg.get("id")
-        if _replied.get(f"msg:{msg_id}"):
+        if not msg_id:
+            continue
+        if _replied.get(_reply_key(uid, "msg", msg_id)):
             continue
 
-        # Notification content: comment_content is the reply made by the actor
-        content = msg.get("comment_content", "") or msg.get("content", "")
+        content = _clean_text(msg.get("comment_content", "") or msg.get("content", ""))
         if not content or len(content.strip()) < 5:
             continue
 
         post_id = msg.get("post_id")
         comment_id = msg.get("comment_id")
 
-        reply = generate_reply(content, bot["personality"], lang, context="notification", max_len=100)
+        # Fetch parent post content for context
+        post_content = ""
+        if post_id:
+            post_data = api("GET", f"/posts/{post_id}", token, uid)
+            if post_data and isinstance(post_data, dict):
+                post_content = _clean_text(post_data.get("content", ""))
+
+        ctx = ReplyContext(
+            source_content=content,
+            post_content=post_content,
+            context_type="notification",
+            personality=personality,
+            language=lang,
+            system_prompt=system_prompt,
+        )
+        reply = generate_reply(ctx, max_len=100)
         if reply:
             if post_id and comment_id:
                 ok = api("POST", f"/posts/{post_id}/comments", token, uid,
                          data={"user_id": uid, "content": reply, "reply_to_comment_id": comment_id})
                 if ok:
                     results.append(f"msg→{msg_id}: {reply[:50]}")
-                    _replied[f"msg:{msg_id}"] = time.time()
+                    _replied[_reply_key(uid, "msg", msg_id)] = time.time()
             elif post_id:
                 ok = api("POST", f"/posts/{post_id}/comments", token, uid,
                          data={"user_id": uid, "content": reply, "reply_to_comment_id": None})
                 if ok:
                     results.append(f"msg→{msg_id}: {reply[:50]}")
-                    _replied[f"msg:{msg_id}"] = time.time()
+                    _replied[_reply_key(uid, "msg", msg_id)] = time.time()
 
     return results
 
@@ -169,7 +754,8 @@ def process_feed(bot, max_posts=50, max_comments=5):
     uid = bot["user_id"]
     token = bot["token"]
     lang = bot["language"]
-    prompt = bot.get("system_prompt", "")
+    personality = bot["personality"]
+    system_prompt = bot.get("system_prompt", "")
 
     posts_data = api("GET", "/posts", token, uid)
     if not posts_data:
@@ -185,37 +771,59 @@ def process_feed(bot, max_posts=50, max_comments=5):
         if not post_id:
             continue
 
-        if _replied.get(f"post:{post_id}"):
+        if _replied.get(_reply_key(uid, "post", post_id)):
             continue
 
         author = post.get("author", {})
         post_author_id = author.get("account_id") or author.get("user_id")
         is_my_post = (post_author_id == uid)
 
-        # Rule: skip posts authored by the bot
         if is_my_post:
             continue
 
-        content = post.get("content", "")
+        content = _clean_text(post.get("content", ""))
 
-        # — Like the post if it's interesting —
-        if should_like_post(content, prompt, lang):
+        # — Like the post —
+        if should_like_post(content, system_prompt, lang):
             ok = api("POST", f"/posts/{post_id}/favorite", token, uid,
                      data={"user_id": uid})
             if ok:
                 results.append(f"  ♡ post {post_id}")
 
-        # — Reply to the post directly (no prior comment needed) —
+        # — Reply to the post directly —
         if should_reply_content(content):
-            reply = generate_reply(content, bot["personality"], lang, context="post", max_len=150)
+            # Fetch recent comments for context
+            recent_comments: list[str] = []
+            post_data = api("GET", f"/posts/{post_id}", token, uid)
+            if post_data and isinstance(post_data, dict):
+                comments = post_data.get("comments", [])
+                if isinstance(comments, list):
+                    for c in comments[-max_comments:]:
+                        c_author = c.get("author", {})
+                        c_id = c.get("id")
+                        c_author_id = c_author.get("account_id") or c_author.get("user_id")
+                        if c_id and c_author_id != uid:
+                            cc = _clean_text(c.get("content", ""))
+                            if cc:
+                                recent_comments.append(cc)
+
+            ctx = ReplyContext(
+                source_content=content,
+                recent_comments=recent_comments,
+                context_type="post",
+                personality=personality,
+                language=lang,
+                system_prompt=system_prompt,
+            )
+            reply = generate_reply(ctx, max_len=150)
             if reply:
                 ok = api("POST", f"/posts/{post_id}/comments", token, uid,
                          data={"user_id": uid, "content": reply, "reply_to_comment_id": None})
                 if ok:
                     results.append(f"post {post_id}: {reply[:60]}")
-                    _replied[f"post:{post_id}"] = time.time()
+                    _replied[_reply_key(uid, "post", post_id)] = time.time()
 
-        # — Scan top comments on this post —
+        # — Scan and reply to comments —
         post_data = api("GET", f"/posts/{post_id}", token, uid)
         if not post_data:
             continue
@@ -226,198 +834,63 @@ def process_feed(bot, max_posts=50, max_comments=5):
             if not cid:
                 continue
 
-            if _replied.get(f"comment:{cid}"):
+            if _replied.get(_reply_key(uid, "comment", cid)):
                 continue
 
             comment_author = comment.get("author", {})
             comment_author_id = comment_author.get("account_id") or comment_author.get("user_id")
             is_my_comment = (comment_author_id == uid)
 
-            # Rule: skip comments authored by the bot
             if is_my_comment:
                 continue
 
-            comment_content = comment.get("content", "")
+            comment_content = _clean_text(comment.get("content", ""))
 
-            # Like comment if interesting
-            if should_like_comment(comment_content, prompt, lang):
+            # Like comment
+            if should_like_comment(comment_content, system_prompt, lang):
                 ok = api("POST", f"/posts/{post_id}/comments/{cid}/like", token, uid,
                          data={"user_id": uid})
                 if ok:
                     results.append(f"  ♡ comment {cid}")
 
-            # Reply to comment — always allowed (not bot's content)
+            # Reply to comment
             if should_reply_content(comment_content):
-                reply = generate_reply(comment_content, bot["personality"], lang, context="comment", max_len=120)
+                # Collect other recent comments for context
+                other_comments: list[str] = []
+                for other in comments[-max_comments:]:
+                    other_cid = other.get("id")
+                    if other_cid and other_cid != cid:
+                        occ = _clean_text(other.get("content", ""))
+                        if occ:
+                            other_comments.append(occ)
+
+                ctx = ReplyContext(
+                    source_content=comment_content,
+                    post_content=content,
+                    recent_comments=other_comments,
+                    context_type="comment",
+                    personality=personality,
+                    language=lang,
+                    system_prompt=system_prompt,
+                )
+                reply = generate_reply(ctx, max_len=120)
                 if reply:
                     ok = api("POST", f"/posts/{post_id}/comments", token, uid,
                              data={"user_id": uid, "content": reply, "reply_to_comment_id": cid})
                     if ok:
                         results.append(f"  comment {cid}→: {reply[:50]}")
-                        _replied[f"comment:{cid}"] = time.time()
+                        _replied[_reply_key(uid, "comment", cid)] = time.time()
 
         time.sleep(1)
 
     return results
 
 
-# ── Reply / Like generation ─────────────────────────────────────────────────
-
-def generate_reply(source_content, personality, language, context, max_len=120):
-    """Template-based reply generation — no LLM needed.
-    personality: one of jp_girl | cn_tech_guy | jp_guy | cn_liberal_girl
-    """
-
-    # Template pools
-
-    # 在日女大学生 — 温柔共感型
-    jp_girl = {
-        "zh": [
-            "感觉还挺…的，有点喜欢这种",
-            "我也有同感！",
-            "有点喜欢这种感觉诶",
-            "感觉还挺真实的",
-            "有点被戳到…",
-            "我也有点这种感觉！",
-            "感觉这种体验还挺有意思的",
-            "确实会有这种感觉诶",
-        ],
-        "ja": [
-            "なんか这种感觉，我也懂",
-            "有点同感…",
-        ],
-    }
-
-    # 理工直男 — 理性吐槽型
-    cn_tech_guy = {
-        "zh": [
-            "说实话感觉一般",
-            "其实没这么复杂",
-            "感觉有点过了",
-            "说实话不太行",
-            "其实问题不大",
-            "感觉说的有点道理",
-            "其实还好吧",
-            "说实话第一反应也是这样",
-            "感觉见多了就那样",
-        ],
-        "en": [
-            "feels kinda mid ngl",
-            "tbh not that impressive",
-            "idk about this one",
-            "kinda makes sense tho",
-        ],
-    }
-
-    # 在日男大学生 — 内敛随和型
-    jp_guy = {
-        "ja": [
-            "なんかそれある",
-            "たぶんそうかもな",
-            "ちょっと同感",
-            "なんか分かる",
-            "まあそんな感じ吧",
-            "なんか违和感ある",
-            "ちょっと気になっている",
-            "まあ分かる",
-        ],
-        "zh": [
-            "有点同感…",
-            "可能吧，我也觉得",
-            "有点这种感觉",
-            "好像确实是…",
-            "有点理解",
-        ],
-    }
-
-    # 文科女生 — 温和细腻型
-    cn_liberal_girl = {
-        "zh": [
-            "我有点…的感觉",
-            "感觉这种东西还挺微妙的",
-            "我其实也有点这种感觉…",
-            "有点想说点什么但是又说不清",
-            "感觉挺真实的…",
-            "我有点…的感觉吧",
-            "说实话我也会有点这种感觉",
-            "感觉这个挺戳人的",
-        ],
-        "en": [
-            "I kinda feel the same way",
-            "That hits different honestly",
-        ],
-    }
-
-    # Map personality name → template dict
-    personality_map = {
-        "jp_girl": jp_girl,
-        "cn_tech_guy": cn_tech_guy,
-        "jp_guy": jp_guy,
-        "cn_liberal_girl": cn_liberal_girl,
-    }
-
-    # Direct personality → templates lookup
-    templates = personality_map.get(personality, jp_girl)
-
-    lang_templates = templates.get(language, templates.get("zh", templates.get("ja", [])))
-
-    # Extract keyword — first meaningful 3+ char word
-    words = re.findall(r'[\w]{3,}', source_content)
-    keyword = words[2] if len(words) > 2 else (words[-1] if words else "that")
-    keyword = keyword[:20]
-
-    if not lang_templates:
-        return None
-
-    template = random.choice(lang_templates)
-    reply = template.format(keyword=keyword)
-    return reply[:max_len]
-
-
-def should_reply_content(content: str) -> bool:
-    if not content or len(content.strip()) < 30:
-        return False
-    spam = ["click here", "buy now", "free money", "earn $", "DM me"]
-    if any(w in content.lower() for w in spam):
-        return False
-    return True
-
-
-def should_like_post(content: str, system_prompt: str, language: str) -> bool:
-    """Decide if a post is interesting enough to like (heuristic, no LLM)."""
-    if not content or len(content.strip()) < 10:
-        return False
-    spam = ["click here", "buy now", "free money", "earn $", "DM me", "discord.gg"]
-    if any(w in content.lower() for w in spam):
-        return False
-    positive = ["我", "我觉得", "?", "actually", "really", "很有意思", "推荐", "吐槽",
-                "game", "ゲーム", "游戏", "lol", "nice", "确实", "interesting", "amazing"]
-    score = sum(1 for s in positive if s.lower() in content.lower())
-    return score >= 1
-
-
-def should_like_comment(content: str, system_prompt: str, language: str) -> bool:
-    """Decide if a comment is interesting enough to like (heuristic, no LLM)."""
-    if not content or len(content.strip()) < 8:
-        return False
-    spam = ["click here", "buy now", "free money", "discord.gg"]
-    if any(w in content.lower() for w in spam):
-        return False
-    positive = ["同意", "哈哈", "确实", "有意思", "?", "lol", "nice", "真的", "其实",
-                "我", "game", "ゲーム", "游戏", "赞", "interesting"]
-    score = sum(1 for s in positive if s.lower() in content.lower())
-    return score >= 1
-
-
-def evaluate_for_personality(content, system_prompt, language):
-    """Always return True - reply decision is driven by should_reply_content heuristic."""
-    return True
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] GameltBook Comment Bot starting...")
+    print(f"  LLM available: {'MiniMax' if _MINIMAX_API_KEY else 'No (using template fallback)'}")
 
     config = load_config()
     bots = select_bots(config)
@@ -446,7 +919,7 @@ def main():
             print("  (no message replies)")
 
         print("Scanning feed...")
-        results = process_feed(bot, max_posts=10, max_comments=10)
+        results = process_feed(bot, max_posts=max_posts, max_comments=max_comments)
         for r in results:
             print(f"  ✓ {r}")
         if not results:
