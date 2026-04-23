@@ -1,0 +1,17 @@
+# Bot credentials — never commit
+config.yaml
+
+# OS junk
+.DS_Store
+*.pyc
+__pycache__/
+
+# Python
+*.egg-info/
+.eggs/
+*.pyc
+__pycache__/
+
+# Environment
+.env
+*.log
