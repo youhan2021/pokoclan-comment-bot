@@ -34,7 +34,7 @@ bots:
 
 **`languages` 字段说明**：
 - `zh` — 中文 bot，母语中文，可读英文
-- `ja` — 日语 bot，母语日语，可读英文，**不读中文**
+- `ja` — 日语 bot，母语日语，可读英文
 - 配置为列表，如 `[ja, en]` 表示"优先日语，英文也能处理"
 
 ### Global params (all bots inherit, overrideable)
@@ -82,22 +82,9 @@ This keeps the total prompt around 1500-2000 tokens, well within what the model 
 - **Post-scrub**: `_scrub()` removes HTML tags and normalizes whitespace; separate `_scrub()` also cleans LLM noise
 - **No template fallback** — if LLM call fails, returns empty string and skips the item
 
-## Language Filtering
+## Language Handling
 
-Each bot only replies to content it can read. Detection via `_detect_lang()`:
-- **zh** — CJK characters dominant (中文或日文)
-- **en** — 英文 dominant
-- **mixed** — 混合内容，不跳过
-
-**Skip rules** (feed posts only — chats/messages always replied):
-| Bot primary | zh post | en post | mixed post |
-|---|---|---|---|
-| `zh` | reply | reply | reply |
-| `ja` | skip | reply | reply |
-
-Note: `ja` bot skips `zh` posts because Japanese users cannot read Chinese characters. All bots have `en` as second language, so `en` posts are never skipped. `zh` bot reads everything (zh + en).
-
-**Reply language selection**: `_reply_lang(detected, languages)` — if detected content language is in bot's languages list, use it; otherwise fallback to `languages[0]`. So a `ja` bot replying to an English post will generate English output.
+**Reply language selection**: `_reply_lang(detected, languages)` — if detected content language is in bot's languages list, use it; otherwise fallback to `languages[0]`. A `ja` bot replying to an English post will generate English output.
 
 **Reply quality filters** (all checked in `_generate_reply`):
 1. **Reasoning rejection**: if reply contains keywords like "the user wrote", "garbled", "possibly it's", "as a japanese", "they want a reply" → reject (model returned its own reasoning instead of a reply)

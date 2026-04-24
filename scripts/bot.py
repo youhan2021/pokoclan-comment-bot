@@ -463,17 +463,9 @@ def main():
                 if like_post(bot, post_id):
                     print(f"  ♥ feed post {post_id}")
 
-                # Skip reply if post language is completely unreadable for this bot.
-                # Bot can read: its primary language + en (all bots have en as 2nd).
-                # - ja bot skips zh posts (can't read Chinese characters)
-                # - zh/ja bots do NOT skip en posts (they can read English)
+                # No language filtering — all posts are candidates
+                # Reply language determined by _reply_lang() below
                 post_lang = _detect_lang(content)
-                primary = languages[0]
-                skip = (post_lang == "zh" and primary in ("ja",))
-                if skip:
-                    print(f"  ~ skip: post_lang={post_lang}, bot_lang={primary}")
-                    time.sleep(1)
-                    continue
 
                 # Randomly choose: reply-to-post OR reply-to-a-comment
                 choice = random.choice(["post", "comment"])
