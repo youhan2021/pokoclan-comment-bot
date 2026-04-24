@@ -215,9 +215,9 @@ def _build_prompt(ctx_type, content, post_content="", recent_comments=None, lang
     if ctx_type == "chat":
         lines.append(f"回复这条私信：\n\"{_scrub(content)}\"")
     elif ctx_type == "notification":
-        lines.append(f"回复通知（别人对你的回复）：\n\"{_scrub(content)}\"")
+        lines.append(f"别人在你的帖子下发了一条评论，现在你要回复这条评论：\n\"{_scrub(content)}\"")
         if post_content:
-            lines.append(f"原帖：\n\"{_scrub(post_content)}\"")
+            lines.append(f"原帖内容：\n\"{_scrub(post_content)}\"")
     elif ctx_type == "comment":
         lines.append(f"回复这条评论：\n\"{_scrub(content)}\"")
         lines.append(f"所在帖子：\n\"{_scrub(post_content)}\"")
@@ -303,7 +303,7 @@ def process_chats(bot):
 # ── Step 2: Messages ──────────────────────────────────────────────────────────
 
 def process_messages(bot):
-    """Fetch recent message notifications (not chats). Returns list of (msg_id, post_id, comment_id, content, post_content)."""
+    """Fetch recent message notifications (not chats). Returns list of dicts."""
     uid = bot["user_id"]
     token = bot["token"]
 
@@ -319,12 +319,19 @@ def process_messages(bot):
         content = _clean(msg.get("comment_content", "") or msg.get("content", ""))
         if not content or len(content) < 3:
             continue
+        post_id = msg.get("post_id")
+        # Fetch post content if we have a post_id
+        post_content = ""
+        if post_id:
+            post_data = api("GET", f"/posts/{post_id}", token, uid)
+            if post_data:
+                post_content = _clean(post_data.get("content", "") or "")
         items.append({
             "id": msg_id,
-            "post_id": msg.get("post_id"),
+            "post_id": post_id,
             "comment_id": msg.get("comment_id"),
             "content": content,
-            "post_content": "",
+            "post_content": post_content,
         })
     return items
 
@@ -438,8 +445,9 @@ def main():
                 post_id = item.get("post_id")
                 comment_id = item.get("comment_id")
                 content = item["content"]
+                post_content = item.get("post_content", "")
 
-                reply = _generate_reply("notification", content, "", [], personality, lang)
+                reply = _generate_reply("notification", content, post_content, [], personality, lang)
                 if not reply:
                     continue
                 if post_id and comment_id:
