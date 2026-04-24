@@ -386,6 +386,20 @@ def like_post(bot, post_id):
     return False
 
 
+def like_comment(bot, post_id, comment_id):
+    """Like a comment (skip if already liked)."""
+    uid = bot["user_id"]
+    token = bot["token"]
+    if _replied.get(_reply_key(uid, "comment_like", f"{post_id}:{comment_id}")):
+        return False
+    raw = api_raw("POST", f"/posts/{post_id}/comments/{comment_id}/like",
+                   token, uid, data={"user_id": uid})
+    if raw.get("status") == 200:
+        _replied[_reply_key(uid, "comment_like", f"{post_id}:{comment_id}")] = time.time()
+        return True
+    return False
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -458,6 +472,9 @@ def main():
                 if not reply:
                     continue
                 if post_id and comment_id:
+                    # Like the comment first
+                    if like_comment(bot, post_id, comment_id):
+                        print(f"  ♥ comment {post_id}/{comment_id}")
                     ok = api("POST", f"/posts/{post_id}/comments", token, uid,
                              data={"user_id": uid, "content": reply, "reply_to_comment_id": comment_id})
                 elif post_id:
@@ -505,6 +522,9 @@ def main():
                                     comments.append({"id": cid, "content": c_content})
                     if comments:
                         chosen = random.choice(comments)
+                        # Like the comment
+                        if like_comment(bot, post_id, chosen["id"]):
+                            print(f"  ♥ comment {post_id}/{chosen['id']}")
                         reply_lang = _reply_lang(_detect_lang(chosen["content"]), languages)
                         reply = _generate_reply("comment", chosen["content"], content, [], personality, reply_lang)
                         if reply:
