@@ -1,0 +1,1350 @@
+#!/usr/bin/env python3
+"""
+GameltBook Comment Bot — main entry point.
+Loads config, randomly selects N bots, then for each bot:
+  1. Check chat threads for messages to reply to
+  2. Check message notifications
+  3. Scan recent posts — like + reply to good ones, then scan comments
+
+Reply generation uses MiniMax LLM with full thread context for contextual, substantive replies.
+Falls back to template-based reply if LLM is unavailable.
+"""
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SKILL_DIR = os.path.dirname(SCRIPT_DIR)
+CONFIG_PATH = os.path.join(SKILL_DIR, "config.yaml")
+API_SCRIPT = "/home/ubuntu/.hermes/skills/gameltbook-api/scripts/gameltbook_api.py"
+BASE_URL = "https://gameltbook.2lh2o.com:8000"
+
+# Load .env if present (provides MINIMAX_CN_API_KEY, etc.)
+_HERMES_HOME = os.environ.get("HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes"))
+_ENV_PATH = os.path.join(_HERMES_HOME, ".env")
+if os.path.exists(_ENV_PATH):
+    for line in open(_ENV_PATH).read().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k and v and k not in os.environ:
+            os.environ[k] = v.strip()
+
+_MINIMAX_API_KEY = os.environ.get("MINIMAX_CN_API_KEY", os.environ.get("MINIMAX_API_KEY", "")).strip()
+_MINIMAX_BASE_URL = "https://api.minimaxi.com/v1"
+
+
+def _minimax_chat(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = "MiniMax-M2.7",
+    temperature: float = 0.7,
+    max_tokens: int = 200,
+    timeout: int = 15,
+    max_attempts: int = 1,
+) -> str | None:
+    """Call MiniMax chat completion API — single attempt, fail-fast on error."""
+    if not _MINIMAX_API_KEY:
+        return None
+
+    import ssl, urllib.error, urllib.request, time
+
+    url = f"{_MINIMAX_BASE_URL}/text/chatcompletion_v2"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt, "name": "MiniMax AI"},
+            {"role": "user", "content": user_prompt, "name": "用户"},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    headers = {
+        "Authorization": f"Bearer {_MINIMAX_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    context = ssl._create_unverified_context()
+    data = json.dumps(payload).encode("utf-8")
+
+    last_error = None
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, context=context, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                result = json.loads(raw)
+            base_resp = result.get("base_resp", {})
+            status_code = base_resp.get("status_code", 0)
+            if status_code != 0:
+                # 5xx = server overloaded, 4xx = bad request — don't retry
+                last_error = f"status {status_code}"
+                if status_code >= 500 and attempt < max_attempts - 1:
+                    time.sleep(0.5)
+                    continue
+                return None
+            choices = result.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                msg = choices[0].get("message", {})
+                content = msg.get("content", "")
+                # MiniMax-M2.7 puts reasoning in reasoning_content; fall back to it if content is empty
+                if not content or not content.strip():
+                    reasoning = msg.get("reasoning_content", "")
+                    if reasoning and reasoning.strip():
+                        content = reasoning.strip()
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            # Empty output — retry after short delay
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)
+                continue
+    print(f"  [MiniMax LLM] all attempts failed: {last_error}", flush=True)
+    return None
+
+
+# ── Reply Context ────────────────────────────────────────────────────────────
+
+@dataclass
+class ReplyContext:
+    """Full context for contextual reply generation."""
+    source_content: str          # The post/comment/message/chat content being replied to
+    post_content: str = ""        # The parent post content (for comment replies)
+    recent_comments: list[str] = field(default_factory=list)  # Recent comments on the post
+    target_comment: str = ""      # The specific comment being replied to (if applicable)
+    context_type: str = "post"    # "post" | "comment" | "notification" | "chat"
+    personality: str = "jp_girl"
+    language: str = "zh"
+    system_prompt: str = ""
+
+
+# ── Reply History (per-uid, prevents cross-bot pollution) ───────────────────
+
+_replied: dict[str, float] = {}
+_CACHE_PATH: str = os.path.join(os.path.dirname(__file__), ".reply_cache.pkl")
+
+import pickle
+
+def _load_cache():
+    """Load persisted reply cache from disk."""
+    global _replied
+    if os.path.exists(_CACHE_PATH):
+        try:
+            with open(_CACHE_PATH, "rb") as f:
+                _replied = pickle.load(f)
+        except Exception:
+            _replied = {}
+
+def _save_cache():
+    """Persist reply cache to disk."""
+    try:
+        with open(_CACHE_PATH, "wb") as f:
+            pickle.dump(_replied, f)
+    except Exception as e:
+        print(f"  [cache] save failed: {e}")
+
+
+def _reply_key(uid: int, kind: str, item_id: int | str) -> str:
+    return f"uid:{uid}:{kind}:{item_id}"
+
+
+# ── Config / API helpers ─────────────────────────────────────────────────────
+
+def load_config():
+    import yaml
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def api(method, endpoint, token, user_id=None, data=None, form=None):
+    """Call gameltbook-api helper. Returns parsed JSON body."""
+    cmd = ["python3", API_SCRIPT, method, f"{BASE_URL}{endpoint}"]
+    cmd += ["--token", token, "--insecure"]
+    if user_id is not None:
+        cmd += ["--user-id", str(user_id)]
+    if data is not None:
+        cmd += ["--data", json.dumps(data, ensure_ascii=False)]
+    if form:
+        for fld in form:
+            cmd += ["--form", fld]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        resp = json.loads(result.stdout)
+    except Exception:
+        print(f"  [API ERROR] stdout={result.stdout[:200]} stderr={result.stderr[:100]}")
+        return None
+
+    if resp.get("status", 0) >= 400:
+        return None
+    return resp.get("body")
+
+
+def select_bots(config):
+    all_bots = config["bots"]
+    n = min(config.get("num_to_select", 1), len(all_bots))
+    return random.sample(all_bots, n)
+
+
+# ── Reply generation (contextual, LLM-powered) ──────────────────────────────
+
+def _build_llm_system_prompt(personality: str, system_prompt: str, language: str) -> str:
+    """Build the system prompt for contextual reply generation.
+    
+    Uses config.yaml system_prompt as PRIMARY instruction — the detailed Chinese
+    personality descriptions (written by the bot operator) are the real instruction,
+    not the hardcoded English generic personas.
+    """
+    # Config.yaml system_prompt is the PRIMARY instruction (not supplemental)
+    if system_prompt.strip():
+        base = system_prompt.strip()
+    else:
+        # Fallback only when no config system_prompt provided
+        persona_fallbacks = {
+            "jp_girl": "你是一个在日本读大学的女大学生。性格温柔，有同理心，说话自然不刻意，偶尔会附和别人表达同感。",
+            "cn_tech_guy": "你是一个中国大学男生，理工科背景。说话理性直接，偶尔吐槽，口语化，不喜欢长篇大论。",
+            "jp_guy": "あなたは日本の大学に通う男子学生です。穏やかで、内気ですが、時々同感を示します。自然に短く返します。",
+            "cn_liberal_girl": "你是一个中国大学女生，文科或传媒方向。性格温和细腻，有同理心，说话柔和但有主见。",
+        }
+        base = persona_fallbacks.get(personality, persona_fallbacks["jp_girl"])
+
+    base += (
+        "\n\n回复规则：简洁1-3句，自然口语，不说自己是AI，不总结，不列点。"
+        "根据话题内容给出真实反应，让人感觉是在和真实的人聊天。"
+    )
+    return base
+
+
+def _build_llm_user_prompt(ctx: ReplyContext) -> str:
+    """Build the user prompt with full thread context for contextual reply."""
+    lines = []
+
+    # Scrub English noise from content before building prompt
+    source = _scrub_english_noise(ctx.source_content)
+    post = _scrub_english_noise(ctx.post_content) if ctx.post_content else ""
+    recent = [_scrub_english_noise(c) for c in ctx.recent_comments] if ctx.recent_comments else []
+
+    if ctx.context_type == "chat":
+        lines.append("You are replying to a private chat message.")
+        lines.append(f"The message you received:\n\"{source}\"")
+    elif ctx.context_type == "notification":
+        lines.append("You are replying to a notification about someone else's reply.")
+        lines.append(f"Their reply:\n\"{source}\"")
+        if post:
+            lines.append(f"The original post:\n\"{post}\"")
+    elif ctx.context_type == "comment":
+        lines.append("You are replying to a comment on a post.")
+        lines.append(f"Post:\n\"{post}\"")
+        lines.append(f"Comment you are replying to:\n\"{source}\"")
+        if recent:
+            lines.append("\nRecent other comments:")
+            for c in recent[:4]:
+                lines.append(f"  - {c}")
+    else:  # post
+        lines.append("You are replying to a forum post.")
+        lines.append(f"Post content:\n\"{source}\"")
+        if recent:
+            lines.append("\nRecent comments:")
+            for c in recent[:4]:
+                lines.append(f"  - {c}")
+
+    lines.append("\nWrite a natural, contextual reply (1-3 sentences, concise).")
+
+    # Language hint
+    if ctx.language == "ja":
+        lines.append("Write your reply in Japanese.")
+    elif ctx.language == "en":
+        lines.append("Write your reply in English.")
+    else:
+        lines.append("Write your reply in Chinese.")
+
+    return "\n".join(lines)
+
+
+def _clean_text(text: str) -> str:
+    """Strip and clean text content."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _scrub_english_noise(text: str) -> str:
+    """Remove English word fragments mixed into Chinese text.
+
+    English fragments like 'perspect' get attached to Chinese content
+    and confuse the LLM. Removes ALL English word sequences (2+ chars)
+    that are adjacent to CJK characters.
+    e.g. "perspect这个游戏" → "这个游戏"
+    e.g. "游戏真的很boring啊" → "游戏真的很啊"
+    """
+    # English word immediately before CJK: "perspect这个" → "这个"
+    text = re.sub(r'[A-Za-z]{2,}(?=[\u4e00-\u9fff\u3040-\u30ff])', '', text)
+    # English word immediately after CJK: "游戏boring啊" → "游戏啊"
+    text = re.sub(r'([\u4e00-\u9fff\u3040-\u30ff])[A-Za-z]{2,}', r'\1', text)
+    # Pure standalone English words (not adjacent to CJK on either side)
+    text = re.sub(r'(?<![A-Za-z\u4e00-\u9fff\u3040-\u30ff])[A-Za-z]{2,}(?![A-Za-z\u4e00-\u9fff\u3040-\u30ff])', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+# ── Content-aware keyword extraction ─────────────────────────────────────────
+
+_CHINESE_STOPWORDS = {
+    "的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
+    "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好",
+    "自己", "这", "那", "他", "她", "它", "这个", "那个", "什么", "怎么", "为什么",
+}
+
+_ENGLISH_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "must", "shall", "can", "need", "it", "this",
+    "that", "these", "those", "i", "you", "he", "she", "we", "they", "what",
+    "which", "who", "whom", "whose", "where", "when", "why", "how", "and",
+    "but", "or", "nor", "so", "yet", "for", "to", "of", "in", "on", "at",
+    "by", "from", "as", "with", "about", "into", "through", "during", "before",
+    "after", "above", "below", "between", "under", "again", "further", "then",
+    "once", "here", "there", "all", "each", "few", "more", "most", "other",
+    "some", "such", "no", "not", "only", "same", "than", "too", "very",
+    "just", "also", "now", "even", "still", "already", "always", "never",
+}
+
+
+
+
+# ── LLM-based content judgment (replaces STOPWORDS heuristics) ─────────────────
+
+def _llm_judge_batch(items: list[dict], language: str) -> dict[str, dict]:
+    """Batch-judge content items using MiniMax LLM.
+
+    Args:
+        items: list of {"id": str, "type": str, "content": str, "post_content": str|None}
+        language: "zh" | "ja" | "en"
+
+    Returns:
+        {id -> {"worthy_reply": bool, "worthy_like": bool, "reason": str}}
+        LLM failure → all items get False conservatively.
+    """
+    if not items:
+        return {}
+
+    lang_instr = {"zh": "回复语言：中文。", "ja": "回复语言：日本語。", "en": "Reply language: English."}.get(language, "回复语言：中文。")
+
+    lines_in = []
+    for i, item in enumerate(items):
+        post_ctx = ""
+        if item.get("post_content"):
+            post_ctx = f"\n原帖内容：{item['post_content'][:200]}"
+        lines_in.append(
+            f"[{i}] ID={item['id']} 类型={item['type']}"
+            f"{post_ctx}"
+            f"\n内容：{item['content'][:300]}"
+        )
+
+    user_prompt = (
+        "你是一个社区内容质量判断模型。判断每条内容是否值得「回复」和「点赞」。\n\n"
+        + "\n\n".join(lines_in) +
+        f"\n\n{lang_instr}\n\n"
+        "判断标准：\n"
+        "- worthy_reply=True：\n"
+        "  · type=chat（用户私信）：用户主动发消息，不回就是已读不回，一律值得回复\n"
+        "  · 其他类型：有话题性，能引发真实讨论，不是垃圾广告、纯感叹词、流水账\n"
+        "    （问问题、分享真实体验、吐槽、有具体信息 → True；'哈哈哈''赞''好''666'广告纯emoji → False）\n"
+        "- worthy_like=True：有一定质量或情感共鸣\n"
+        "  （有观点、有情绪、有信息量 → True；纯垃圾 → False）\n"
+        "输出格式（严格JSON数组，无其他文字）：\n"
+        "[\n  {\"id\": \"0\", \"worthy_reply\": true, \"worthy_like\": true, \"reason\": \"...\"}\n]"
+    )
+
+    raw = _minimax_chat(
+        system_prompt="你是一个严格的内容质量判断模型。" + lang_instr,
+        user_prompt=user_prompt,
+        max_tokens=400,
+        temperature=0.1,
+    )
+
+    if not raw:
+        return {item["id"]: {"worthy_reply": False, "worthy_like": False, "reason": "llm_fail"} for item in items}
+
+    import json as _json
+    try:
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        results = _json.loads(raw[start:end]) if start != -1 and end > start else _json.loads(raw)
+    except Exception:
+        return {item["id"]: {"worthy_reply": False, "worthy_like": False, "reason": "parse_fail"} for item in items}
+
+    # LLM returns {"id": "0"}, {"id": "1"} matching the [0], [1] indices in the prompt
+    # Map back to original item ids by position
+    lookup = {}
+    for i, item in enumerate(items):
+        key = str(i)
+        # Find the result with this index
+        for r in results:
+            rid = r.get("id")
+            if rid is not None and str(rid) == key:
+                lookup[str(item["id"])] = r
+                break
+        else:
+            lookup[str(item["id"])] = {"worthy_reply": False, "worthy_like": False, "reason": "not_in_response"}
+
+    return lookup
+
+
+# ── Old STOPWORDS-based heuristics (kept for reference, not used) ─────────────
+
+
+def _extract_keywords(content: str) -> tuple[str, str]:
+    """Extract a meaningful subject keyword and sentiment from content.
+    Returns (subject_keyword, sentiment).
+    Subject is a clean entity noun/keyword, not a full phrase.
+    Sentiment is detected from the full content.
+    """
+    if not content:
+        return "", ""
+
+    # Detect language
+    cjk = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]", content))
+    english = len(re.findall(r"[a-zA-Z]{3,}", content))
+
+    # ── Sentiment: from full content ──────────────────────────────────────────
+    if cjk > english:
+        neg = any(w in content for w in [
+            "难", "差", "烂", "垃圾", "失望", "无聊", "累", "烦", "坑", "后悔",
+            "不行", "讨厌", "无感", "尴尬", "难绷", "吐", "无语", "烦躁",
+            "难过", "伤心", "心痛", "糟糕", "可悲", "遗憾", "扯", "假", "骗"
+        ])
+        pos = any(w in content for w in [
+            "好", "棒", "赞", "喜欢", "牛", "强", "推荐", "精彩", "有趣",
+            "有意思", "期待", "惊喜", "完美", "可爱", "甜", "开心", "快乐",
+            "感动", "治愈", "精彩", "满分", "值", "值得", "划算", "爱"
+        ])
+        sentiment = "neg" if neg else ("pos" if pos else "neutral")
+
+        # Subject: 2-char CJK words only, all non-stopword, prefer non-leading.
+        # Strictly 2-char avoids in-word slice artifacts (4-char "未来世界里" → "来世界里" is nonsense)
+        raw_words = re.findall(r"[\u4e00-\u9fff]{2}", content)
+        # All chars must be non-stopword
+        meaningful = [w for w in raw_words if all(c not in _CHINESE_STOPWORDS for c in w)]
+        # Skip leading topic markers (first occurrence of common topic-starter words)
+        topic_starters = {"这个", "今天", "我的", "这是", "这部", "真是", "这个", "那个"}
+        seen_topics = 0
+        candidates = []
+        for w in meaningful:
+            if seen_topics < 2 and w in topic_starters:
+                seen_topics += 1
+                continue
+            candidates.append(w)
+            if len(candidates) >= 3:
+                break
+        subject = candidates[0] if candidates else (meaningful[0] if meaningful else "")
+
+    elif english > cjk:
+        neg = any(w in content.lower() for w in [
+            "bad", "boring", "hard", "difficult", "sucks", "worst", "hate",
+            "disappointed", "terrible", "awful", "bland", "disappointing",
+            "frustrating", "annoying", "waste", "overpriced", "expensive"
+        ])
+        pos = any(w in content.lower() for w in [
+            "good", "great", "awesome", "amazing", "love", "best", "fun",
+            "interesting", "nice", "cool", "cute", "sweet", "recommend",
+            "worth", "perfect", "excellent", "fantastic", "incredible"
+        ])
+        sentiment = "neg" if neg else ("pos" if pos else "neutral")
+
+        words = re.findall(r"[a-zA-Z]{3,}", content.lower())
+        meaningful = [w for w in words if w not in _ENGLISH_STOPWORDS]
+        start = max(0, int(len(meaningful) * 0.3))
+        subject = meaningful[start] if start < len(meaningful) else (meaningful[0] if meaningful else "")
+
+    else:
+        sentiment = "neutral"
+        subject = ""
+
+    return subject[:8], sentiment
+
+
+# ── Contextual template pools (with slots) ───────────────────────────────────
+
+_CTEMPLATE_POOLS = {
+    "jp_girl": {
+        "zh": {
+            "pos": [
+                ("挺喜欢{subject}的", 8),
+                ("{subject}确实有意思！", 8),
+                ("感觉{subject}还挺棒的", 8),
+                ("同感！{subject}挺戳人的", 9),
+                ("我也有点喜欢{subject}诶", 9),
+                ("{subject}挺有感触的", 7),
+                ("感觉还挺真实的，{subject}", 10),
+                ("确实诶，{subject}有点意思", 10),
+            ],
+            "neg": [
+                ("{subject}确实有点…", 7),
+                ("感觉{subject}一般般吧", 8),
+                ("有点无语{subject}", 6),
+                ("{subject}确实不太行", 8),
+                ("说实话对{subject}无感", 8),
+            ],
+            "neutral": [
+                ("{subject}…有点这种感觉", 9),
+                ("有点喜欢{subject}诶", 7),
+                ("{subject}感觉还挺真实的", 10),
+                ("确实会有这种感觉诶", 8),
+                ("我也有同感！", 5),
+                ("有点被戳到…", 5),
+            ],
+        },
+        "ja": {
+            "pos": [
+                ("なんか{subject}いいよね", 9),
+                ("たぶんそうかもな", 7),
+                ("ちょっと同感", 5),
+                ("なんか分かる", 6),
+            ],
+            "neg": [
+                ("なんか{subject}违和感ある", 10),
+                ("まあそんな感じ吧", 8),
+                ("ちょっと气になる", 7),
+            ],
+            "neutral": [
+                ("なんかそれある", 7),
+                ("たぶんそうかもな", 8),
+                ("まあ分かる", 5),
+            ],
+        },
+    },
+    "cn_tech_guy": {
+        "zh": {
+            "pos": [
+                ("{subject}其实还行", 7),
+                ("说实话{subject}没那么差", 10),
+                ("{subject}感觉还行吧", 8),
+                ("其实还好，{subject}", 7),
+            ],
+            "neg": [
+                ("{subject}感觉一般", 6),
+                ("说实话{subject}不太行", 9),
+                ("{subject}有点过了", 7),
+                ("其实没这么复杂，{subject}", 10),
+                ("感觉有点过了，{subject}", 9),
+            ],
+            "neutral": [
+                ("说实话第一反应也是这样", 11),
+                ("感觉见多了就那样", 9),
+                ("其实问题不大", 6),
+                ("感觉说的有点道理", 8),
+                ("其实没这么复杂", 7),
+            ],
+        },
+        "en": {
+            "pos": [
+                ("{subject} kinda good tho", 14),
+                ("not bad honestly", 13),
+                ("gotta admit {subject} is ok", 19),
+            ],
+            "neg": [
+                ("feels kinda mid ngl", 16),
+                ("tbh not that impressive", 21),
+                ("idk about {subject}", 14),
+            ],
+            "neutral": [
+                ("kinda makes sense tho", 19),
+                ("fair enough", 10),
+                ("idk honestly", 12),
+            ],
+        },
+    },
+    "jp_guy": {
+        "ja": {
+            "pos": [
+                ("なんか{subject}いいよね", 9),
+                ("たぶんそうかもな", 8),
+                ("ちょっと同感", 5),
+                ("まあそんな感じ吧", 8),
+            ],
+            "neg": [
+                ("なんか违和感ある", 7),
+                ("まあ分かる", 5),
+                ("ちょっと气になる", 7),
+            ],
+            "neutral": [
+                ("なんかそれある", 7),
+                ("まあ分かる", 5),
+                ("たぶんそうかもな", 8),
+            ],
+        },
+        "zh": {
+            "pos": [
+                ("{subject}其实还行", 7),
+                ("有点同感", 4),
+            ],
+            "neg": [
+                ("{subject}感觉一般", 7),
+                ("可能吧，我也觉得", 7),
+            ],
+            "neutral": [
+                ("有点这种感觉", 6),
+                ("可能吧", 4),
+                ("好像确实是…", 6),
+            ],
+        },
+    },
+    "cn_liberal_girl": {
+        "zh": {
+            "pos": [
+                ("我有点喜欢{subject}…的感觉", 12),
+                ("{subject}感觉还挺微妙的", 10),
+                ("有点想说{subject}但又说不清", 12),
+                ("感觉挺真实的…", 7),
+                ("其实我也有点这种感觉", 10),
+            ],
+            "neg": [
+                ("有点说不清的感觉…", 8),
+                ("{subject}感觉有点微妙", 9),
+                ("说实话对{subject}有点无语", 11),
+            ],
+            "neutral": [
+                ("我有点…的感觉", 7),
+                ("感觉这种东西还挺微妙的", 11),
+                ("感觉挺真实的…", 7),
+                ("有点想说点什么但是又说不清", 14),
+                ("我有点…的感觉吧", 8),
+            ],
+        },
+        "en": {
+            "pos": [
+                ("I kinda feel the same way", 24),
+                ("That hits different honestly", 26),
+            ],
+            "neg": [
+                ("kinda off tbh", 12),
+                ("not really feeling it", 19),
+            ],
+            "neutral": [
+                ("I kinda feel that", 17),
+                ("that makes sense i guess", 22),
+            ],
+        },
+    },
+}
+
+
+def _generate_reply_template_fallback(source_content: str, personality: str, language: str, max_len: int) -> str:
+    """Fallback: content-aware template-based reply using extracted keywords + sentiment."""
+    pool = _CTEMPLATE_POOLS.get(personality, _CTEMPLATE_POOLS["jp_girl"])
+    lang_pool = pool.get(language, pool.get("zh", pool.get("ja", {})))
+
+    subject, sentiment = _extract_keywords(source_content)
+
+    # Try sentiment-keyed templates first
+    candidates = []
+    if sentiment in lang_pool:
+        candidates = lang_pool[sentiment]
+
+    # Fallback to neutral if nothing found
+    if not candidates and "neutral" in lang_pool:
+        candidates = lang_pool["neutral"]
+
+    if not candidates:
+        return ""
+
+    # Pick random template (weighted by priority)
+    weighted = [(t, w) for t, w in candidates]
+    templates, weights = zip(*weighted)
+    template = random.choices(templates, weights=weights, k=1)[0]
+
+    # Fill slot
+    if "{subject}" in template:
+        reply = template.replace("{subject}", subject) if subject else template.replace("{subject}", "")
+    else:
+        reply = template
+
+    reply = re.sub(r"\s+", " ", reply).strip()
+    return reply[:max_len]
+
+
+def generate_reply(ctx: ReplyContext, max_len: int = 1024) -> str:
+    """Generate a contextual reply using MiniMax LLM only (no template fallback)."""
+    system_prompt = _build_llm_system_prompt(ctx.personality, ctx.system_prompt, ctx.language)
+    user_prompt = _build_llm_user_prompt(ctx)
+
+    llm_reply = _minimax_chat(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=min(max_len, 1024),
+        temperature=0.7,
+    )
+
+    if llm_reply and llm_reply.strip():
+        return llm_reply.strip()[:max_len]
+
+    return ""
+
+
+# ── Heuristics ───────────────────────────────────────────────────────────────
+
+def should_reply_content(content: str) -> bool:
+    if not content or len(content.strip()) < 5:
+        return False
+    spam = ["click here", "buy now", "free money", "earn $", "DM me", "discord.gg"]
+    if any(w in content.lower() for w in spam):
+        return False
+    return True
+
+
+def should_like_post(content: str, system_prompt: str, language: str) -> bool:
+    if not content or len(content.strip()) < 10:
+        return False
+    spam = ["click here", "buy now", "free money", "earn $", "DM me", "discord.gg"]
+    if any(w in content.lower() for w in spam):
+        return False
+    positive = ["我", "我觉得", "?", "actually", "really", "很有意思", "推荐", "吐槽",
+                "game", "ゲーム", "游戏", "lol", "nice", "确实", "interesting", "amazing"]
+    score = sum(1 for s in positive if s.lower() in content.lower())
+    return score >= 1
+
+
+def should_like_comment(content: str, system_prompt: str, language: str) -> bool:
+    if not content or len(content.strip()) < 8:
+        return False
+    spam = ["click here", "buy now", "free money", "discord.gg"]
+    if any(w in content.lower() for w in spam):
+        return False
+    positive = ["同意", "哈哈", "确实", "有意思", "?", "lol", "nice", "真的", "其实",
+                "我", "game", "ゲーム", "游戏", "赞", "interesting"]
+    score = sum(1 for s in positive if s.lower() in content.lower())
+    return score >= 1
+
+
+# ── Step 1: Chat replies ──────────────────────────────────────────────────────
+
+def process_chats_with(bot, items: list[dict], judgments: dict) -> list[str]:
+    """Reply to pre-judged chat items. Reuses LLM results from pre-check phase.
+
+    items: from _scan_chats_items (already LLM-judged worthy).
+    judgments: LLM judgments dict keyed by item id.
+    """
+    uid = bot["user_id"]
+    token = bot["token"]
+    lang = bot["language"]
+    personality = bot["personality"]
+    system_prompt = bot.get("system_prompt", "")
+
+    # Filter to worth-reply items
+    reply_candidates = [
+        (item, judgments.get(str(item["id"]), {}))
+        for item in items
+        if judgments.get(str(item["id"]), {}).get("worthy_reply", False)
+    ]
+
+    if not reply_candidates:
+        return []
+
+    # Randomly pick up to 2
+    selected = random.sample(reply_candidates, min(2, len(reply_candidates)))
+
+    results = []
+    for item, judgment in selected:
+        chat_id = int(item["id"])
+        content = item["content"]
+
+        ctx = ReplyContext(
+            source_content=content,
+            context_type="chat",
+            personality=personality,
+            language=lang,
+            system_prompt=system_prompt,
+        )
+        reply = generate_reply(ctx, max_len=1024)
+        if not reply:
+            continue
+
+        ok = api("POST", f"/chats/{chat_id}/messages", token, uid,
+                 data={"user_id": uid, "content": reply})
+        if ok:
+            results.append(f"chat→{chat_id}: {reply[:50]}")
+            _replied[_reply_key(uid, "chat", chat_id)] = time.time()
+
+    return results
+
+
+# ── Step 2: Message notifications ────────────────────────────────────────────
+
+def process_messages_with(bot, items: list[dict], judgments: dict) -> list[str]:
+    """Reply to pre-judged message items. Reuses LLM results from pre-check phase.
+
+    items: from _scan_messages_items.
+    judgments: LLM judgments dict keyed by item id.
+    """
+    uid = bot["user_id"]
+    token = bot["token"]
+    lang = bot["language"]
+    personality = bot["personality"]
+    system_prompt = bot.get("system_prompt", "")
+
+    results = []
+    for item, judgment in selected:
+        msg_id = int(item["id"])
+        content = item["content"]
+        post_id = item["_post_id"]
+        comment_id = item["_comment_id"]
+        post_content = item["post_content"]
+
+        ctx = ReplyContext(
+            source_content=content,
+            post_content=post_content or "",
+            context_type="notification",
+            personality=personality,
+            language=lang,
+            system_prompt=system_prompt,
+        )
+        reply = generate_reply(ctx, max_len=1024)
+        if not reply:
+            continue
+
+        if post_id and comment_id:
+            ok = api("POST", f"/posts/{post_id}/comments", token, uid,
+                     data={"user_id": uid, "content": reply, "reply_to_comment_id": comment_id})
+        elif post_id:
+            ok = api("POST", f"/posts/{post_id}/comments", token, uid,
+                     data={"user_id": uid, "content": reply, "reply_to_comment_id": None})
+        else:
+            ok = None
+
+        if ok:
+            results.append(f"msg→{msg_id}: {reply[:50]}")
+            _replied[_reply_key(uid, "msg", msg_id)] = time.time()
+
+    return results
+
+
+# ── Step 3: Feed + Comments ──────────────────────────────────────────────────
+
+def process_feed(bot, max_posts=50, max_comments=5):
+    """Feed scan with LLM-based batch judgment.
+
+    Flow:
+      1. GET /posts -> quick pre-filter (skip own posts, skip already-replied)
+      2. Batch LLM call for all posts -> decide worth_reply / worth_like
+      3. Execute per post: like if worthy, fetch full post for reply-worthy ones
+      4. Scan comments from full post, batch-judge them via LLM
+      5. Execute replies and likes based on LLM judgment
+    """
+    uid = bot["user_id"]
+    token = bot["token"]
+    lang = bot["language"]
+    personality = bot["personality"]
+    system_prompt = bot.get("system_prompt", "")
+
+    posts_data = api("GET", "/posts", token, uid)
+    if not posts_data:
+        return []
+
+    posts = posts_data if isinstance(posts_data, list) else posts_data.get("posts", posts_data.get("results", []))
+    if not posts:
+        return []
+
+    # -- Phase 1: quick pre-filter, collect post items for batch judgment --
+    post_items = []
+    for post in posts[:max_posts]:
+        post_id = post.get("id")
+        if not post_id:
+            continue
+        if _replied.get(_reply_key(uid, "post", post_id)):
+            continue
+        author = post.get("author", {})
+        post_author_id = author.get("account_id") or author.get("user_id")
+        if post_author_id == uid:
+            continue
+        content = _clean_text(post.get("content", ""))
+        if not content or len(content.strip()) < 5:
+            continue
+        post_items.append({
+            "id": str(post_id),
+            "type": "post",
+            "content": content,
+            "post_content": None,
+        })
+
+    # -- Phase 2: batch LLM judgment for posts --
+    post_judgments = _llm_judge_batch(post_items, lang) if post_items else {}
+
+    results = []
+
+    # -- Phase 3: execute per post --
+    for item in post_items:
+        post_id = int(item["id"])
+        content = item["content"]
+        j = post_judgments.get(str(post_id), {})
+        worthy_like = j.get("worthy_like", False)
+        worthy_reply = j.get("worthy_reply", False)
+
+        # Like if worthy
+        if worthy_like:
+            ok = api("POST", f"/posts/{post_id}/favorite", token, uid, data={"user_id": uid})
+            if ok:
+                results.append(f"  ♡ post {post_id}")
+
+        # Only fetch full post if reply-worthy OR liked (to scan comments)
+        if not (worthy_reply or worthy_like):
+            continue
+
+        post_data = api("GET", f"/posts/{post_id}", token, uid)
+        if not post_data:
+            continue
+        comments = post_data.get("comments", []) if isinstance(post_data, dict) else []
+        if not isinstance(comments, list):
+            comments = []
+
+        # -- Reply to post if worthy --
+        if worthy_reply:
+            recent_comments = [
+                _clean_text(c.get("content", ""))
+                for c in comments[-max_comments:]
+                if c.get("id")
+                and (c.get("author", {}).get("account_id") or c.get("author", {}).get("user_id")) != uid
+                and _clean_text(c.get("content", ""))
+            ]
+            ctx = ReplyContext(
+                source_content=content,
+                recent_comments=recent_comments[:4],
+                context_type="post",
+                personality=personality,
+                language=lang,
+                system_prompt=system_prompt,
+            )
+            reply = generate_reply(ctx, max_len=1024)
+            if reply:
+                ok = api("POST", f"/posts/{post_id}/comments", token, uid,
+                         data={"user_id": uid, "content": reply, "reply_to_comment_id": None})
+                if ok:
+                    results.append(f"post {post_id}: {reply[:60]}")
+                    _replied[_reply_key(uid, "post", post_id)] = time.time()
+
+        # -- Scan and judge comments --
+        comment_items = []
+        for comment in comments[:max_comments]:
+            cid = comment.get("id")
+            if not cid:
+                continue
+            if _replied.get(_reply_key(uid, "comment", cid)):
+                continue
+            comment_author_id = comment.get("author", {}).get("account_id") or comment.get("author", {}).get("user_id")
+            if comment_author_id == uid:
+                continue
+            comment_content = _clean_text(comment.get("content", ""))
+            if not comment_content:
+                continue
+            comment_items.append({
+                "id": str(cid),
+                "type": "comment",
+                "content": comment_content,
+                "post_content": content,
+            })
+
+        comment_judgments = _llm_judge_batch(comment_items, lang) if comment_items else {}
+
+        for citem in comment_items:
+            cid = int(citem["id"])
+            comment_content = citem["content"]
+            cj = comment_judgments.get(str(cid), {})
+            worthy_like_c = cj.get("worthy_like", False)
+            worthy_reply_c = cj.get("worthy_reply", False)
+
+            if worthy_like_c:
+                api("POST", f"/posts/{post_id}/comments/{cid}/like", token, uid, data={"user_id": uid})
+
+            if worthy_reply_c:
+                other_comments = [
+                    _clean_text(oc.get("content", ""))
+                    for oc in comments[-max_comments:]
+                    if oc.get("id") and oc.get("id") != cid
+                    and (oc.get("author", {}).get("account_id") or oc.get("author", {}).get("user_id")) != uid
+                    and _clean_text(oc.get("content", ""))
+                ]
+                ctx = ReplyContext(
+                    source_content=comment_content,
+                    post_content=content,
+                    recent_comments=other_comments[:4],
+                    context_type="comment",
+                    personality=personality,
+                    language=lang,
+                    system_prompt=system_prompt,
+                )
+                reply = generate_reply(ctx, max_len=1024)
+                if reply:
+                    ok = api("POST", f"/posts/{post_id}/comments", token, uid,
+                             data={"user_id": uid, "content": reply, "reply_to_comment_id": cid})
+                    if ok:
+                        results.append(f"  comment {cid}: {reply[:50]}")
+                        _replied[_reply_key(uid, "comment", cid)] = time.time()
+
+        time.sleep(1)
+
+    return results
+
+
+def process_feed_items(bot, feed_items: list[dict], max_comments: int = 5) -> list[str]:
+    """Reply to pre-selected feed items (posts + their comments).
+
+    feed_items: list of items from _scan_feed_items (already LLM-judged worthy).
+    Each item has: id(str), type="post", content, post_content, _raw(post dict).
+
+    Flow per item:
+      1. Fetch full post for comment scan
+      2. Batch-judge comments, pick up to 2 worth-replying
+      3. Reply to post (with comment context)
+      4. Reply to selected comments
+    """
+    uid = bot["user_id"]
+    token = bot["token"]
+    lang = bot["language"]
+    personality = bot["personality"]
+    system_prompt = bot.get("system_prompt", "")
+
+    results = []
+    for item in feed_items:
+        post_id = int(item["id"])
+        content = item["content"]
+
+        # Fetch full post for comments
+        post_data = api("GET", f"/posts/{post_id}", token, uid)
+        if not post_data:
+            continue
+        comments = post_data.get("comments", []) if isinstance(post_data, dict) else []
+        if not isinstance(comments, list):
+            comments = []
+
+        # ── Collect comment items for batch judgment ──────────────────────────
+        comment_items = []
+        for comment in comments[:max_comments]:
+            cid = comment.get("id")
+            if not cid:
+                continue
+            if _replied.get(_reply_key(uid, "comment", cid)):
+                continue
+            comment_author_id = comment.get("author", {}).get("account_id") or comment.get("author", {}).get("user_id")
+            if comment_author_id == uid:
+                continue
+            comment_content = _clean_text(comment.get("content", ""))
+            if not comment_content:
+                continue
+            comment_items.append({
+                "id": str(cid),
+                "type": "comment",
+                "content": comment_content,
+                "post_content": content,
+            })
+
+        comment_judgments = _llm_judge_batch(comment_items, lang) if comment_items else {}
+
+        # Filter to worthy-reply comments, randomly pick up to 2
+        reply_candidates = [
+            (ci, comment_judgments.get(str(ci["id"]), {}))
+            for ci in comment_items
+            if comment_judgments.get(str(ci["id"]), {}).get("worthy_reply", False)
+        ]
+        if len(reply_candidates) > 2:
+            reply_candidates = random.sample(reply_candidates, 2)
+
+        # ── Reply to post ────────────────────────────────────────────────────
+        recent_comments = [
+            _clean_text(c.get("content", ""))
+            for c in comments[-max_comments:]
+            if c.get("id")
+            and (c.get("author", {}).get("account_id") or c.get("author", {}).get("user_id")) != uid
+            and _clean_text(c.get("content", ""))
+        ]
+        ctx = ReplyContext(
+            source_content=content,
+            recent_comments=recent_comments[:4],
+            context_type="post",
+            personality=personality,
+            language=lang,
+            system_prompt=system_prompt,
+        )
+        reply = generate_reply(ctx, max_len=1024)
+        if reply:
+            ok = api("POST", f"/posts/{post_id}/comments", token, uid,
+                     data={"user_id": uid, "content": reply, "reply_to_comment_id": None})
+            if ok:
+                results.append(f"post {post_id}: {reply[:60]}")
+                _replied[_reply_key(uid, "post", post_id)] = time.time()
+
+        # ── Reply to selected comments ───────────────────────────────────────
+        for ci, cj in reply_candidates:
+            cid = int(ci["id"])
+            comment_content = ci["content"]
+            other_comments = [
+                _clean_text(oc.get("content", ""))
+                for oc in comments[-max_comments:]
+                if oc.get("id") and oc.get("id") != cid
+                and (oc.get("author", {}).get("account_id") or oc.get("author", {}).get("user_id")) != uid
+                and _clean_text(oc.get("content", ""))
+            ]
+            ctx = ReplyContext(
+                source_content=comment_content,
+                post_content=content,
+                recent_comments=other_comments[:4],
+                context_type="comment",
+                personality=personality,
+                language=lang,
+                system_prompt=system_prompt,
+            )
+            reply = generate_reply(ctx, max_len=1024)
+            if reply:
+                ok = api("POST", f"/posts/{post_id}/comments", token, uid,
+                         data={"user_id": uid, "content": reply, "reply_to_comment_id": cid})
+                if ok:
+                    results.append(f"  comment {cid}: {reply[:50]}")
+                    _replied[_reply_key(uid, "comment", cid)] = time.time()
+
+        time.sleep(1)
+
+    return results
+
+
+# ── Quick source pre-check ───────────────────────────────────────────────────
+
+def _scan_chats_items(bot) -> tuple[int, list[dict], dict]:
+    """Fetch chats, batch-judge with LLM, return (count_worthy, items, judgments).
+
+    Returns items and judgments so execute phase can reuse without re-calling LLM.
+    """
+    uid = bot["user_id"]
+    token = bot["token"]
+    lang = bot["language"]
+
+    data = api("GET", f"/users/{uid}/chats", token, uid)
+    if not data:
+        return 0, [], {}
+
+    chats = data if isinstance(data, list) else data.get("chats", data.get("results", []))
+    if not chats:
+        return 0, [], {}
+
+    items = []
+    for chat in chats[:10]:
+        chat_id = chat.get("id")
+        if not chat_id:
+            continue
+        if _replied.get(_reply_key(uid, "chat", chat_id)):
+            continue
+
+        thread = api("GET", f"/chats/{chat_id}", token, uid)
+        if not thread:
+            continue
+
+        messages = thread if isinstance(thread, list) else thread.get("messages", thread.get("results", []))
+        if not messages:
+            continue
+
+        last = messages[-1]
+        last_sender = last.get("author", {}).get("account_id") or last.get("account_id")
+        last_content = _clean_text(last.get("content", ""))
+
+        if last_sender == uid:
+            continue
+        if not last_content or len(last_content.strip()) < 2:
+            continue
+
+        items.append({
+            "id": str(chat_id),
+            "type": "chat",
+            "content": last_content,
+            "post_content": None,
+            "_messages": messages,
+        })
+
+    if not items:
+        return 0, [], {}
+
+    judgments = _llm_judge_batch(items, lang)
+    worthy = [item for item in items if judgments.get(str(item["id"]), {}).get("worthy_reply", False)]
+    return len(worthy), items, judgments
+
+
+def _scan_messages_items(bot) -> tuple[int, list[dict], dict]:
+    """Fetch messages, batch-judge with LLM, return (count_worthy, items, judgments).
+
+    Returns items and judgments so execute phase can reuse without re-calling LLM.
+    """
+    uid = bot["user_id"]
+    token = bot["token"]
+    lang = bot["language"]
+
+    data = api("GET", f"/users/{uid}/messages", token, uid)
+    if not data:
+        return 0, [], {}
+
+    messages = data if isinstance(data, list) else data.get("messages", data.get("results", []))
+    if not messages:
+        return 0, [], {}
+
+    items = []
+    for msg in messages[:20]:
+        msg_id = msg.get("id")
+        if not msg_id:
+            continue
+        if _replied.get(_reply_key(uid, "msg", msg_id)):
+            continue
+
+        content = _clean_text(msg.get("comment_content", "") or msg.get("content", ""))
+        if not content or len(content.strip()) < 2:
+            continue
+
+        items.append({
+            "id": str(msg_id),
+            "type": "message",
+            "content": content,
+            "post_content": None,
+            "_post_id": msg.get("post_id"),
+            "_comment_id": msg.get("comment_id"),
+        })
+
+    if not items:
+        return 0, [], {}
+
+    judgments = _llm_judge_batch(items, lang)
+    worthy = [item for item in items if judgments.get(str(item["id"]), {}).get("worthy_reply", False)]
+    return len(worthy), items, judgments
+
+
+def _scan_feed_items(bot, max_posts: int = 20) -> tuple[int, list[dict]]:
+    """Batch-judge feed posts, return (count_worthy, list_of_worthy_items).
+
+    Each returned item: {"id": str, "type": "post", "content": str, "post_content": None}
+    Does NOT fetch individual post details (no comments included).
+    """
+    uid = bot["user_id"]
+    token = bot["token"]
+    lang = bot["language"]
+
+    posts_data = api("GET", "/posts", token, uid)
+    if not posts_data:
+        return 0, []
+
+    posts = posts_data if isinstance(posts_data, list) else posts_data.get("posts", posts_data.get("results", []))
+    if not posts:
+        return 0, []
+
+    items = []
+    for post in posts[:max_posts]:
+        post_id = post.get("id")
+        if not post_id:
+            continue
+        if _replied.get(_reply_key(uid, "post", post_id)):
+            continue
+        author = post.get("author", {})
+        post_author_id = author.get("account_id") or author.get("user_id")
+        if post_author_id == uid:
+            continue
+        content = _clean_text(post.get("content", ""))
+        if not content or len(content.strip()) < 2:
+            continue
+        items.append({
+            "id": str(post_id),
+            "type": "post",
+            "content": content,
+            "post_content": None,
+            "_raw": post,
+        })
+
+    if not items:
+        return 0, []
+
+    judgments = _llm_judge_batch(items, lang)
+    worthy = [
+        item for item in items
+        if judgments.get(str(item["id"]), {}).get("worthy_reply", False)
+    ]
+    return len(worthy), worthy
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    _load_cache()
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] GameltBook Comment Bot starting...")
+    print(f"  LLM available: {'MiniMax' if _MINIMAX_API_KEY else 'No (using template fallback)'}")
+
+    config = load_config()
+    bots = select_bots(config)
+    max_comments = config.get("feed", {}).get("max_comments", 5)
+
+    print(f"Selected {len(bots)} bots: {[b['user_id'] for b in bots]}")
+
+    for bot in bots:
+        uid = bot["user_id"]
+        personality = bot["personality"]
+        print(f"\n--- Bot {uid} ({personality}) ---")
+
+        # ── Phase 1: pre-check each source (scan + batch LLM judgment) ─────────
+        print("  [pre-check] probing sources...")
+        chat_count, chat_items, chat_judgments = _scan_chats_items(bot)
+        msg_count,  msg_items,  msg_judgments  = _scan_messages_items(bot)
+        feed_count, feed_worthy_items            = _scan_feed_items(bot, max_posts=20)
+
+        print(f"  [pre-check] chat={chat_count} messages={msg_count} feed={feed_count}")
+
+        # Build weighted pool from sources that have content
+        pool = []   # [(source_name, weight), ...]
+        if chat_count > 0:
+            pool.append(("chat",     3))
+        if msg_count > 0:
+            pool.append(("messages", 2))
+        if feed_count > 0:
+            pool.append(("feeds",    1))
+
+        if not pool:
+            print("  所有来源都没有值得回复的内容，跳过")
+            time.sleep(2)
+            continue
+
+        # Weighted random pick
+        total = sum(w for _, w in pool)
+        roll  = random.random() * total
+        cumulative = 0
+        source = pool[-1][0]  # default to last
+        for name, weight in pool:
+            cumulative += weight
+            if roll < cumulative:
+                source = name
+                break
+
+        print(f"  选中来源: {source} (权重池: {pool})")
+
+        # ── Phase 2: execute selected source (reuses LLM judgments from pre-check) ──
+        if source == "chat":
+            results = process_chats_with(bot, chat_items, chat_judgments)
+        elif source == "messages":
+            results = process_messages_with(bot, msg_items, msg_judgments)
+        else:
+            results = process_feed_items(bot, feed_worthy_items, max_comments=max_comments)
+
+        for r in results:
+            print(f"  ✓ {r}")
+        if not results:
+            print("  (无实际操作)")
+
+        time.sleep(2)
+
+    _save_cache()
+    print(f"\n[{datetime.now(timezone.utc).isoformat()}] Done.")
+
+
+if __name__ == "__main__":
+    main()
