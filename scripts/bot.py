@@ -272,7 +272,7 @@ def process_chats(bot):
     chat_count = 0
     for chat in chats[:6]:
         chat_id = chat.get("id")
-        if not chat_id or _replied.get(_reply_key(uid, "chat", chat_id)):
+        if not chat_id:
             continue
         thread = api("GET", f"/chats/{chat_id}", token, uid)
         if not thread:
@@ -282,8 +282,14 @@ def process_chats(bot):
             continue
         last = messages[-1]
         last_sender = last.get("author", {}).get("account_id") or last.get("account_id")
+        last_msg_id = last.get("id")
         last_content = _clean(last.get("content", ""))
-        if last_sender == uid or len(last_content) < 3:
+        # Skip if last message is from bot, or if we already replied to this specific message
+        if last_sender == uid:
+            continue
+        if last_msg_id and _replied.get(_reply_key(uid, "chat_msg", last_msg_id)):
+            continue
+        if len(last_content) < 3:
             continue
 
         reply = _generate_reply("chat", last_content, "", [], personality, languages[0])
@@ -293,7 +299,8 @@ def process_chats(bot):
                  data={"user_id": uid, "content": reply})
         if ok:
             results.append(f"chat→{chat_id}: {reply[:50]}")
-            _replied[_reply_key(uid, "chat", chat_id)] = time.time()
+            if last_msg_id:
+                _replied[_reply_key(uid, "chat_msg", last_msg_id)] = time.time()
             chat_count += 1
             if chat_count >= 2:
                 break
