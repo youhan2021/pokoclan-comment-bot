@@ -107,6 +107,13 @@ python3 ~/.hermes/skills/pokoclan-comment-bot/scripts/bot.py
 - **Reply quality rejection**: When MiniMax returns its own reasoning instead of a reply (e.g. "The user wrote... they want a reply in Japanese"), the reply quality filters catch it and reject it silently. This manifests as apparently skipped items — no reply is sent but the bot continues.
 - **`_detect_lang` threshold**: `cjk > en * 0.6` returns "zh", `en > cjk * 1.5` returns "en", else "mixed"
 
+### subprocess API calls — MUST catch TimeoutExpired
+
+- `subprocess.run(..., timeout=30)` raises `subprocess.TimeoutExpired` on timeout — it does **NOT** set `r.timeout` to True
+- The old code did `r = subprocess.run(...); if r.timeout: ...` — this branch never fires; instead Python throws `TimeoutExpired` and crashes the subprocess wrapper, leaving the bot process hanging
+- **Fix**: wrap in `try/except subprocess.TimeoutExpired: return None` (for `api()`) or `return {"status": -2, "body": "timeout"}` (for `api_raw()`)
+- **Impact if not fixed**: bot process hangs indefinitely on a slow API call; cron scheduler skips all subsequent runs while the stale process is still alive → gap in posting schedule
+
 ### MiniMax LLM integration
 
 - **MiniMax-M2.7**: content may be in `reasoning_content` if `content` is empty — always check both

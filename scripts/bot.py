@@ -114,7 +114,11 @@ def api(method, endpoint, token, user_id=None, data=None):
         cmd += ["--user-id", str(user_id)]
     if data is not None:
         cmd += ["--data", json.dumps(data, ensure_ascii=False)]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        print(f"  [API TIMEOUT] {method} {endpoint}", flush=True)
+        return None
     try:
         resp = json.loads(r.stdout)
     except Exception:
@@ -131,7 +135,11 @@ def api_raw(method, endpoint, token, user_id=None, data=None):
         cmd += ["--user-id", str(user_id)]
     if data is not None:
         cmd += ["--data", json.dumps(data, ensure_ascii=False)]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        print(f"  [API TIMEOUT] {method} {endpoint}", flush=True)
+        return {"status": -2, "body": "timeout"}
     try:
         return json.loads(r.stdout)
     except Exception:
